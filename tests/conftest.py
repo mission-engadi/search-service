@@ -1,120 +1,129 @@
-"""Pytest configuration and fixtures.
-
-This file contains shared fixtures used across all tests.
-"""
-
-import asyncio
-from typing import AsyncGenerator, Generator
-
+"""Test configuration and fixtures."""
 import pytest
-import pytest_asyncio
+import asyncio
+from typing import Generator, AsyncGenerator
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import StaticPool
 
 from app.core.config import settings
-from app.core.security import create_access_token
-from app.db.base_class import Base
+from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
+from app.models.search_index import SearchIndex
+from app.models.search_query import SearchQuery
+from app.models.search_suggestion import SearchSuggestion
+from app.models.index_job import IndexJob
 
 # Test database URL
-TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/test_db"
+TEST_DATABASE_URL = "sqlite:///:memory:"
 
-# Create async engine for tests
-test_engine = create_async_engine(
+# Create test engine
+engine = create_engine(
     TEST_DATABASE_URL,
-    poolclass=NullPool,
-    echo=False,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
-
-# Create session factory
-TestSessionLocal = sessionmaker(
-    test_engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
-
-
-@pytest.fixture(scope="session")
-def event_loop() -> Generator:
-    """Create an event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="function")
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Create a fresh database session for each test.
-    
-    This fixture:
-    1. Creates all tables before the test
-    2. Provides a database session
-    3. Rolls back changes after the test
-    4. Drops all tables
-    """
-    # Create tables
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    # Create session
-    async with TestSessionLocal() as session:
-        yield session
-        await session.rollback()
-    
-    # Drop tables
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 @pytest.fixture(scope="function")
-def client(db_session: AsyncSession) -> Generator:
-    """Create a test client with database session override."""
-    
-    async def override_get_db():
-        yield db_session
+def db() -> Generator[Session, None, None]:
+    """Create a fresh database for each test."""
+    Base.metadata.create_all(bind=engine)
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(scope="function")
+def client(db: Session) -> Generator[TestClient, None, None]:
+    """Create a test client with database override."""
+    def override_get_db():
+        try:
+            yield db
+        finally:
+            pass
     
     app.dependency_overrides[get_db] = override_get_db
-    
     with TestClient(app) as test_client:
         yield test_client
-    
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
-def auth_token() -> str:
-    """Create a test JWT token."""
-    return create_access_token(
-        subject="1",
-        additional_claims={
-            "email": "test@example.com",
-            "roles": ["user"],
-        },
+def sample_search_index(db: Session) -> SearchIndex:
+    """Create sample search index entry."""
+    index_entry = SearchIndex(
+        document_id=1,
+        document_type="article",
+        title="Sample Article",
+        content="This is sample content for testing search functionality.",
+        language="en",
+        author="Test Author",
+        status="published",
+        metadata={"tags": ["test", "sample"]}
     )
+    db.add(index_entry)
+    db.commit()
+    db.refresh(index_entry)
+    return index_entry
 
 
 @pytest.fixture
-def admin_token() -> str:
-    """Create a test JWT token with admin role."""
-    return create_access_token(
-        subject="1",
-        additional_claims={
-            "email": "admin@example.com",
-            "roles": ["admin", "user"],
-        },
+def sample_search_query(db: Session) -> SearchQuery:
+    """Create sample search query."""
+    query = SearchQuery(
+        query_text="test query",
+        filters={"document_type": "article"},
+        results_count=5,
+        response_time=0.123,
+        user_id=1
     )
+    db.add(query)
+    db.commit()
+    db.refresh(query)
+    return query
 
 
 @pytest.fixture
-def auth_headers(auth_token: str) -> dict:
-    """Create authorization headers with test token."""
-    return {"Authorization": f"Bearer {auth_token}"}
+def sample_suggestion(db: Session) -> SearchSuggestion:
+    """Create sample search suggestion."""
+    suggestion = SearchSuggestion(
+        suggestion="test suggestion",
+        language="en",
+        usage_count=10
+    )
+    db.add(suggestion)
+    db.commit()
+    db.refresh(suggestion)
+    return suggestion
 
 
 @pytest.fixture
-def admin_headers(admin_token: str) -> dict:
-    """Create authorization headers with admin token."""
-    return {"Authorization": f"Bearer {admin_token}"}
+def sample_index_job(db: Session) -> IndexJob:
+    """Create sample index job."""
+    job = IndexJob(
+        job_type="full_reindex",
+        status="completed",
+        total_documents=100,
+        processed_documents=100,
+        failed_documents=0
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+@pytest.fixture
+def auth_headers() -> dict:
+    """Mock authentication headers."""
+    return {
+        "Authorization": "Bearer mock_token",
+        "X-User-ID": "1"
+    }
